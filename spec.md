@@ -485,20 +485,22 @@ Client and registry implementations SHOULD expect to be able to support manifest
 
 ###### Pushing Manifests with Subject
 
-When processing a request for an image manifest with the `subject` field, a registry implementation that supports the [referrers API](#listing-referrers) MUST respond with the response header `OCI-Subject: <subject digest>` to indicate to the client that the registry processed the request's `subject`.
+When processing a request for an image manifest with the `subject` field, a registry implementation that supports the [referrers API](#listing-referrers) MUST respond with the response header `OCI-Subject: <subject digest>` to indicate to the client that the registry processed the request's `subject`. A registry which supports the [referrers API](#listing-referrers) but does not generate a referrers list MUST additionally respond with the response header `OCI-REFERRERS-LIST: immutable` to indicate the client must push the referrers list
 
-When pushing a manifest with the `subject` field and the `OCI-Subject` header was not set, the client MUST:
+When pushing a manifest with the `subject` field and either the `OCI-Subject` header was not set or the `OCI-REFERRERS-LIST` is set to `immutable`, the client MUST:
 
-1. Pull the current referrers list using the [referrers tag schema](#referrers-tag-schema).
+1. Pull the current referrers list using [referrers API](#pushing-referrers) if `OCI-REFERRERS-LIST: immutable` is set, otherwise fallback to the [referrers tag schema](#referrers-tag-schema).
 1. If that pull returns a manifest other than the expected image index, the client SHOULD report a failure and skip the remaining steps.
 1. If the tag returns a 404, the client MUST begin with an empty image index.
 1. Verify the descriptor for the manifest is not already in the referrers list (duplicate entries SHOULD NOT be created).
-1. Append a descriptor for the pushed manifest to the manifests in the referrers list.
+1. Append or replace a descriptor for the pushed manifest to the manifests in the referrers list.
    The value of the `artifactType` MUST be set to the `artifactType` value in the pushed manifest, if present.
    If the `artifactType` is empty or missing in a pushed image manifest, the value of `artifactType` MUST be set to the config descriptor `mediaType` value.
    All annotations from the pushed manifest MUST be copied to this descriptor.
-1. Push the updated referrers list using the same [referrers tag schema](#referrers-tag-schema).
-   The client MAY use conditional HTTP requests to prevent overwriting a referrers list that has changed since it was first pulled.
+1. Push the updated referrers list using the same endpoint path used to pull the referrers list.
+   The client MUST use conditional HTTP request if the registry returned an `ETag` header to allow a registry to prevent overwriting a referrers list that has changed since it was first pulled.
+   The server MAY ignore the conditional HTTP headers.
+   If the server returns a `412`, the client SHOULD start over with pulling the current referrers list or report a failure.
 
 #### Content Discovery
 
@@ -605,11 +607,13 @@ If a query results in no matching referrers, an empty manifest list MUST be retu
 }
 ```
 
+If the returned manifest is immutable and the registry supports conditional HTTP, the registry MUST set the `ETag` header with the digest of the returned manifest.
+
 A `Link` header MUST be included in the response when the descriptor list cannot be returned in a single manifest.
 Each response is an image index with different descriptors in the `manifests` field.
 The `Link` header MUST be set according to [RFC5988](https://www.rfc-editor.org/rfc/rfc5988.html) with the Relation Type `rel="next"`.
 
-The registry SHOULD support filtering on `artifactType`.
+A registry which generates the manifest registry SHOULD support filtering on `artifactType`.
 To fetch the list of referrers with a filter, perform a `GET` request to a path in the following format: `/v2/<name>/referrers/<digest>?artifactType=<mediaType>` <sup>[end-12b](#endpoints)</sup>.
 If filtering is requested and applied, the response MUST include a header `OCI-Filters-Applied: artifactType` denoting that an `artifactType` filter was applied.
 If multiple filters are applied, the header MUST contain a comma separated list of applied filters.
@@ -645,6 +649,45 @@ OCI-Filters-Applied: artifactType
 If the [referrers API](#listing-referrers) returns a 404, the client MUST fallback to pulling the [referrers tag schema](#referrers-tag-schema).
 The response SHOULD be an image index with the same content that would be expected from the referrers API.
 If the response to the [referrers API](#listing-referrers) is a 404, and the tag schema does not return a valid image index, the client SHOULD assume there are no referrers to the manifest.
+
+##### Pushing Referrers
+
+*Note: this feature was added in distibution-spec 1.1.
+Registries should only use this endpoint if it treats referrers list as immutable and does not support generation of the referrers list.
+Clients should only use this endpoint if the registry has returned `OCI-REFERRERS-LIST: immutable`.*
+
+To push a referrers list, perform a `PUT` request to a path in the following format, and with the following headers and body: `/v2/<name>/referrers/<digest>` <sup>[end-12c](#endpoints)</sup>
+
+`<name>` is the namespace of the repository, and `<digest>` is the digest of the manifest specified in the `subject` field.
+
+Clients MUST set the `Content-Type` header to the type of the manifest being pushed and that type MUST be an OCI image index<sup>[apdx-6](#appendix)</sup>.
+The client SHOULD NOT include parameters on the `Content-Type` header (see [RFC7231](https://www.rfc-editor.org/rfc/rfc7231#section-3.1.1.1)).
+The registry SHOULD ignore parameters on the `Content-Type` header.
+All manifests SHOULD include a `mediaType` field declaring the type of the manifest being pushed.
+If a manifest includes a `mediaType` field, clients MUST set the `Content-Type` header to the value specified by the `mediaType` field.
+
+```
+Content-Type: application/vnd.oci.image.index.v1+json
+```
+Manifest byte stream:
+```
+{
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  ...
+}
+```
+
+`<digest>` MUST match the `subject` digest in the manifest and any first level children manifests if the `subject` digest is not empty.
+
+The registry MUST store the manifest in the exact byte representation provided by the client.
+
+Upon a successful upload, the registry MUST return response code `201 Created`.
+If an upload was rejected based on Conditional HTTP headers, the registry MUST return response code `412 Precondition Failed`.
+An attempt to pull a nonexistent repository MUST return response code `404 Not Found`.
+
+A registry SHOULD enforce some limit on the maximum manifest size that it can accept.
+A registry that enforces this limit SHOULD respond to a request to push a manifest over this limit with a response code `413 Payload Too Large`.
+Client and registry implementations SHOULD expect to be able to support manifest pushes of at least 4 megabytes.
 
 #### Content Management
 
@@ -724,7 +767,7 @@ When registries add support for the referrers API, this API needs to account for
 
 1. Registries MUST include preexisting image manifests that are listed in an image index tagged with the [referrers tag schema](#referrers-tag-schema) and have a valid `subject` field in the referrers API response.
 1. Registries MAY include all preexisting image manifests with a `subject` field in the referrers API response.
-1. After the referrers API is enabled, Registries MUST include all newly pushed image manifests with a valid `subject` field in the referrers API response.
+1. After the referrers API is enabled, Registries MUST include all newly pushed image manifests with a valid `subject` field in the referrers API response if the referrers response is not immutable.
 
 ### API
 
@@ -757,6 +800,7 @@ This endpoint MAY be used for authentication/authorization purposes, but this is
 | end-11  | `POST`         | `/v2/<name>/blobs/uploads/?mount=<digest>&from=<other_name>`   | `201`       | `404`             |
 | end-12a | `GET`          | `/v2/<name>/referrers/<digest>`                                | `200`       | `404`/`400`       |
 | end-12b | `GET`          | `/v2/<name>/referrers/<digest>?artifactType=<artifactType>`    | `200`       | `404`/`400`       |
+| end-12c | `PUT`          | `/v2/<name>/referrers/<digest>`                                | `200`       | `404`/`412`       |
 | end-13  | `GET`          | `/v2/<name>/blobs/uploads/<reference>`                         | `204`       | `404`             |
 
 #### Error Codes
